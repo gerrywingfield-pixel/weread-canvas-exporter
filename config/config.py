@@ -20,4 +20,4 @@ HEADLESS_MODE = True  # 无头模式
 CHROME_BIN = None  # 自动检测
 
 # 书籍信息
-DEFAULT_BOOK_ID = "60d32800813abb495g018370"  # 财报真相：识别数字背后的投资风险
+DEFAULT_BOOK_ID = ""  # 运行时从书架选择
