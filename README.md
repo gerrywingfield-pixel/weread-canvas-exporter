@@ -78,7 +78,7 @@ python weread_exporter.py --login
 3. 登录成功后自动跳转到 **微信读书 Skill** 页面
 4. 点击头像 → 「微信读书 Skill」 → **生成 API Key** → 粘贴到终端
 
-> **为什么要 API Key？** 按章节导出（`--skill`）需要它来获取官方目录结构，做章节边界判定。一键整本导出不需要 API Key。
+> **为什么要 API Key？** 按章节导出（`--skill`）需要它来获取官方目录结构，做章节边界判定。整本导出（`--export`）不需要 API Key，自上传书籍也走整本导出。
 >
 > `--login` 一次扫码完成两件事：Cookie 写入 `cookie.txt` + API Key 写入 `config/.env`。以后不需要重新登录。
 
@@ -99,9 +99,11 @@ python weread_exporter.py --export <readerId>
 
 ### 方式二：按章导出（精细化，需要 API Key）
 
+**书架书** 和 **搜索来的书** 都用同一命令：
 ```bash
-python weread_exporter.py --skill <readerId> --range 5-8 --api-id <数字bookId>
+python weread_exporter.py --skill <readerId> --range 5-8
 ```
+`api_book_id` 自动匹配（书架→搜索，两级兜底），极少数搜不到时加 `--api-id <数字bookId>`。
 
 适合场景：只想导正文（跳过推荐序、版权页等非原著内容），或只导指定的某几章。
 
@@ -110,25 +112,22 @@ python weread_exporter.py --skill <readerId> --range 5-8 --api-id <数字bookId>
 2. 输入要导出的章节范围
 3. 每章输出一个独立 `.md` 文件
 
-### 如何获取 readerId 和 api_book_id？
+### 如何获取 readerId？
 
-| 来源 | readerId（阅读器URL中的ID） | api_book_id（API数字ID） |
-|:-----|:--------------------------|:------------------------|
-| 书架上的书 | `--list` 直接拿到 | `--list` 直接拿到 |
-| 搜索来的书 | 浏览器搜索后点进去拿 | 搜索时自动拿到 |
+| 来源 | readerId |
+|:-----|:---------|
+| 书架上的书 | `--list` 直接拿到 |
+| 搜索来的书 | 浏览器搜索后点进去拿 |
 
-**书架书**按章导出最简单：
+**按章导出无需手动获取 api_book_id**，代码自动从书架或搜索 API 匹配。仅极少数搜不到时需 `--api-id` 手动指定。
+
+**按章导出**（书架书和搜索来的书通用）：
 ```bash
-# 1. 列出书架
+# 1. 列出书架（或浏览器搜索获取 readerId）
 python weread_exporter.py --list
 
-# 2. 直接导出（书架书的 api_book_id 自动获取）
+# 2. 直接导出（api_book_id 自动匹配，无需手动传）
 python weread_exporter.py --skill <readerId> --range 5-8
-```
-
-**搜索来的书**（不在书架上的）需要显式传 `--api-id`：
-```bash
-python weread_exporter.py --skill <readerId> --range 5-8 --api-id <数字bookId>
 ```
 
 ---
@@ -143,8 +142,8 @@ python weread_exporter.py --skill <readerId> --range 5-8 --api-id <数字bookId>
 | `--export <readerId>` | 整本导出（自动判定付费） | ❌ |
 | `--export <readerId> --trial y` | 强制试读导出 | ❌ |
 | `--export <readerId> --trial n` | 付费书跳过 | ❌ |
-| `--skill <readerId> --range N-M` | 按章导出（书架书） | ✅ |
-| `--skill <readerId> --range N-M --api-id <id>` | 按章导出（搜索来的书） | ✅ |
+| `--skill <readerId> --range N-M` | 按章导出（自动匹配，书架+搜索都支持） | ✅ |
+| `--skill <readerId> --range N-M --api-id <id>` | 按章导出（搜不到时手动兜底） | ✅ |
 | `--verbose` | 显示详细翻页日志 | 随主命令 |
 
 ### 使用示例

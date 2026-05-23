@@ -20,7 +20,7 @@
 
 import sys, time, os, re, json
 from collections import defaultdict
-from config.official_api import get_chapter_list, get_shelf_full
+from config.official_api import get_chapter_list, get_shelf_full, search
 
 from playwright.sync_api import sync_playwright
 
@@ -857,9 +857,12 @@ class WeReadExporter:
             print()
             print('  ╔══════════════════════════════════════════════════════╗')
             print('  ║  按章导出需要 API Key 来获取官方目录结构             ║')
-            print('  ║  请先运行 python weread_exporter.py --login          ║')
-            print('  ║  扫码登录后，按提示在个人中心 → 微信读书 Skill      ║')
-            print('  ║  生成 API Key 并粘贴，后续导出自动对齐章节。        ║')
+            print('  ║  没有 API Key 可以改用整本导出：                     ║')
+            print('  ║      python weread_exporter.py --export <readerId>  ║')
+            print('  ║  整本导出不需要 API Key，自上传书籍也支持。         ║')
+            print('  ║  如需 API Key（按章导出），请先运行：               ║')
+            print('  ║      python weread_exporter.py --login              ║')
+            print('  ║  扫码后 → 个人中心 → 微信读书 Skill → 生成 Key     ║')
             print('  ╚══════════════════════════════════════════════════════╝')
             print()
             return []
@@ -934,7 +937,25 @@ class WeReadExporter:
                         self._log(f'自动匹配 api_book_id={api_book_id}')
                         break
                 if not api_book_id:
-                    self._log('书架中未匹配到当前书籍，使用 DOM 分类（如需精确范围请传 --api-id）')
+                    # 书架未匹配 → 用搜索 API 按书名查（搜索来的书也自动获取）
+                    self._log('书架未匹配，尝试搜索 API...')
+                    try:
+                        search_res = search(book_title, count=5)
+                        for res in search_res.get('results', []):
+                            for bk in res.get('books', []):
+                                info = bk.get('bookInfo', {})
+                                t = info.get('title', '')
+                                bid = info.get('bookId')
+                                if bid and (book_title in t or t in book_title):
+                                    api_book_id = bid
+                                    self._log(f'搜索 API 匹配到 api_book_id={api_book_id}')
+                                    break
+                            if api_book_id:
+                                break
+                        if not api_book_id:
+                            self._log('搜索 API 也未匹配到，使用 DOM 分类（如需精确范围请传 --api-id）')
+                    except Exception as e2:
+                        self._log(f'搜索 API 匹配失败: {e2}')
             except Exception as e:
                 self._log(f'自动获取 api_book_id 失败，回退 DOM 分类: {e}')
 
