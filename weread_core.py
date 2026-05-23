@@ -461,11 +461,24 @@ class WeReadExporter:
         返回 True=登录成功, False=用户取消。
         """
         self._log('正在打开浏览器，请扫码登录微信读书...')
-        p = sync_playwright().start()
-        browser = p.chromium.launch(
-            headless=False,
-            args=['--disable-blink-features=AutomationControlled', '--dns-servers=8.8.8.8']
-        )
+        try:
+            p = sync_playwright().start()
+            browser = p.chromium.launch(
+                headless=False,
+                args=['--disable-blink-features=AutomationControlled', '--dns-servers=8.8.8.8']
+            )
+        except Exception as e:
+            self._log('无法打开浏览器进行登录')
+            print()
+            print('  原因：当前环境可能没有图形界面支持。')
+            print()
+            print('  解决方法：')
+            print('    ① 在本地 WSL（有桌面环境的）运行一次:')
+            print('       python weread_exporter.py --login')
+            print('    ② 扫码登录后，cookie 和 API Key 会自动保存')
+            print('    ③ 后续在 AI Agent 中可直接调用 --export / --skill')
+            print()
+            return False
         ctx = browser.new_context(viewport={'width': 1280, 'height': 800})
         page = ctx.new_page()
         page.goto('https://weread.qq.com', wait_until='domcontentloaded', timeout=30000)

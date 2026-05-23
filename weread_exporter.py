@@ -545,70 +545,24 @@ def main():
     if len(sys.argv) > 1:
         return cli_main()
 
-    # 无参数 → 交互模式
+    # 无参数 -> 显示帮助，引导使用 --login
+    import argparse
+    parser = argparse.ArgumentParser(description='微信读书导出工具')
+    parser.add_argument('--list', action='store_true', help='列出书架书籍（JSON格式）')
+    parser.add_argument('--export', type=str, metavar='BOOK_ID', help='导出整本书')
+    parser.add_argument('--skill', type=str, metavar='BOOK_ID',
+                        help='Skill模式：按章节导出，显示导引树，每章一个文件')
+    parser.add_argument('--range', type=str, metavar='N-M',
+                        help='章节范围（配合 --skill 使用，如 "5-8"）')
+    parser.add_argument('--api-id', type=str, metavar='API_BOOK_ID',
+                        help='REST API 数字 bookId（配合 --skill 用于搜索来的书）')
+    parser.add_argument('--trial', choices=['y', 'n'], help='付费书策略: y=导出试读, n=跳过')
+    parser.add_argument('--login', action='store_true', help='强制重新登录')
+    parser.add_argument('--verbose', action='store_true', help='显示详细日志')
+    parser.print_help()
     print()
-    print('  ╔══════════════════════════════════════╗')
-    print('  ║     微信读书导出工具 v2.0            ║')
-    print('  ║      一键导出整本书                   ║')
-    print('  ╚══════════════════════════════════════╝')
+    print('首次使用请先运行:  python weread_exporter.py --login')
     print()
-
-    cookie = ensure_login()
-    if not cookie:
-        return
-
-    p = sync_playwright().start()
-    browser = p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
-    ctx = browser.new_context(viewport={'width': 1280, 'height': 800})
-    ctx.add_cookies([
-        {'name': k.split('=')[0], 'value': k.split('=')[1], 'domain': '.weread.qq.com', 'path': '/'}
-        for k in cookie.split('; ')
-    ])
-    page = ctx.new_page()
-
-    try:
-        while True:
-            book_id, book_title = select_book(page)
-            if not book_id:
-                break
-
-            out_file = export_full_book(page, book_id, book_title)
-            if out_file is None:
-                continue
-
-            print()
-            print('  ┌─────────────────────────────────────┐')
-            print('  │  请选择：                            │')
-            print('  │                                     │')
-            print('  │  [1] 继续导出另一本书                │')
-            print('  │                                     │')
-            print('  │  [2] 退出程序                        │')
-            print('  │                                     │')
-            print('  │  请输入 1-2: _                       │')
-            print('  └─────────────────────────────────────┘')
-            print()
-
-            while True:
-                choice = input('  请选择 (1-2): ').strip()
-                if choice == '1':
-                    break
-                elif choice == '2':
-                    log('已退出，欢迎下次使用')
-                    browser.close()
-                    p.stop()
-                    return
-                else:
-                    print('  输入无效，请输入 1 或 2')
-
-    finally:
-        try:
-            browser.close()
-        except:
-            pass
-        try:
-            p.stop()
-        except:
-            pass
 
 
 if __name__ == '__main__':
