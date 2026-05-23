@@ -854,6 +854,15 @@ class WeReadExporter:
         # 检查 API Key（按章导出必须）
         api_key = os.environ.get('WEREAD_API_KEY', '')
         if not api_key:
+            # 尝试从 config/.env 读取
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config', '.env')
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        if line.startswith('WEREAD_API_KEY='):
+                            api_key = line.strip().split('=', 1)[1]
+                            break
+        if not api_key:
             print()
             print('  ╔══════════════════════════════════════════════════════╗')
             print('  ║  按章导出需要 API Key 来获取官方目录结构             ║')
