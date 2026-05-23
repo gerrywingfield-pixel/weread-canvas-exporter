@@ -940,28 +940,47 @@ class WeReadExporter:
         if not api_book_id:
             try:
                 shelf_books = get_shelf_full()
+                # 优先精确匹配，退到子串匹配
+                exact = None
                 for sb in shelf_books:
-                    if book_title in sb.get('title', '') or sb.get('title', '') in book_title:
-                        api_book_id = sb.get('bookId')
-                        self._log(f'自动匹配 api_book_id={api_book_id}')
+                    st = sb.get('title', '')
+                    if st == book_title:
+                        exact = sb
                         break
-                if not api_book_id:
-                    # 书架未匹配 → 用搜索 API 按书名查（搜索来的书也自动获取）
+                if exact:
+                    api_book_id = exact.get('bookId')
+                    self._log(f'书架精确匹配 api_book_id={api_book_id}')
+                else:
+                    for sb in shelf_books:
+                        st = sb.get('title', '')
+                        if book_title in st or st in book_title:
+                            api_book_id = sb.get('bookId')
+                            self._log(f'书架子串匹配 api_book_id={api_book_id}')
+                            break
+                if not api_book_id:# 书架未匹配 → 用搜索 API 按书名查（搜索来的书也自动获取）
                     self._log('书架未匹配，尝试搜索 API...')
                     try:
-                        search_res = search(book_title, count=5)
+                        search_res = search(book_title, count=10)
+                        candidates = []
                         for res in search_res.get('results', []):
                             for bk in res.get('books', []):
                                 info = bk.get('bookInfo', {})
                                 t = info.get('title', '')
                                 bid = info.get('bookId')
                                 if bid and (book_title in t or t in book_title):
-                                    api_book_id = bid
-                                    self._log(f'搜索 API 匹配到 api_book_id={api_book_id}')
-                                    break
-                            if api_book_id:
-                                break
-                        if not api_book_id:
+                                    candidates.append((t, bid))
+                        if candidates:
+                            # 优先精确匹配
+                            exact = [c for c in candidates if c[0] == book_title]
+                            if exact:
+                                api_book_id = exact[0][1]
+                                self._log(f'搜索精确匹配 api_book_id={api_book_id}')
+                            else:
+                                # 退到子串匹配，用最短距离（标题长度最接近的）
+                                candidates.sort(key=lambda c: abs(len(c[0]) - len(book_title)))
+                                api_book_id = candidates[0][1]
+                                self._log(f'搜索近似匹配 api_book_id={api_book_id} (title="{candidates[0][0]}")')
+                        else:
                             self._log('搜索 API 也未匹配到，使用 DOM 分类（如需精确范围请传 --api-id）')
                     except Exception as e2:
                         self._log(f'搜索 API 匹配失败: {e2}')
@@ -975,30 +994,36 @@ class WeReadExporter:
                 # 建立 API 标题 → level 映射（标题匹配而非索引对应）
                 api_level_map = {}
                 for ch in api_chapters:
-                    api_level_map[ch['title'].strip()] = '一级' if ch['level'] == 1 else '二级'
-                matched = 0
-                for c in classified:
-                    title = c['text'].strip()
-                    if title in api_level_map:
-                        c['level'] = api_level_map[title]
-                        matched += 1
-                    else:
-                        # 尝试子串匹配（DOM 可能截断或前后有空格差异）
-                        found = False
-                        for api_title, api_level in api_level_map.items():
-                            if title and (title in api_title or api_title in title):
-                                c['level'] = api_level
-                                matched += 1
-                                found = True
-                                break
-                        if not found:
-                            c['level'] = '二级'  # 未匹配视为细粒度子节
-                l1_count = sum(1 for c in classified if c['level'] == '一级')
-                self._log(f'API TOC 匹配 {matched}/{len(classified)} 条（含 {l1_count} 个一级）')
-                # 构建 API ↔ DOM 对齐（用于 API+DOM 联合导航）
-                aligned_chapters = _align_api_dom_toc(api_chapters, classified)
-                api_l1_count = sum(1 for a in aligned_chapters if a is not None)
-                self._log(f'API↔DOM 对齐: {api_l1_count} 个一级章节')
+                    title = ch.get('title', '').strip()
+                    level = ch.get('level', 2)  # 缺省 level 时默认为二级
+                    if title:
+                        api_level_map[title] = '一级' if level == 1 else '二级'
+                if not api_level_map:
+                    self._log('API TOC 无有效标题层级，保留 DOM 分类')
+                else:
+                    matched = 0
+                    for c in classified:
+                        title = c['text'].strip()
+                        if title in api_level_map:
+                            c['level'] = api_level_map[title]
+                            matched += 1
+                        else:
+                            # 尝试子串匹配（DOM 可能截断或前后有空格差异）
+                            found = False
+                            for api_title, api_level in api_level_map.items():
+                                if title and (title in api_title or api_title in title):
+                                    c['level'] = api_level
+                                    matched += 1
+                                    found = True
+                                    break
+                            if not found:
+                                c['level'] = '二级'  # 未匹配视为细粒度子节
+                    l1_count = sum(1 for c in classified if c['level'] == '一级')
+                    self._log(f'API TOC 匹配 {matched}/{len(classified)} 条（含 {l1_count} 个一级）')
+                    # 构建 API ↔ DOM 对齐（用于 API+DOM 联合导航）
+                    aligned_chapters = _align_api_dom_toc(api_chapters, classified)
+                    api_l1_count = sum(1 for a in aligned_chapters if a is not None)
+                    self._log(f'API↔DOM 对齐: {api_l1_count} 个一级章节')
             except Exception as e:
                 self._log(f'API TOC 获取失败，回退 DOM 分类: {e}')
 
