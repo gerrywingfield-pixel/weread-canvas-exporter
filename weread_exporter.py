@@ -56,8 +56,8 @@ def cli_main():
         return
 
     if not exporter.check_login():
-        print('未登录，请先运行 python weread_exporter.py 进行交互式登录', flush=True)
-        print('或使用 --login 参数弹出浏览器登录', flush=True)
+        print('未登录，请先运行以下命令进行登录:', flush=True)
+        print('  python weread_exporter.py --login', flush=True)
         sys.exit(1)
 
     try:
