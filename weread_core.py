@@ -20,7 +20,7 @@
 
 import sys, time, os, re, json
 from collections import defaultdict
-from config.official_api import get_chapter_list
+from config.official_api import get_chapter_list, get_shelf_full
 
 from playwright.sync_api import sync_playwright
 
@@ -851,6 +851,19 @@ class WeReadExporter:
         if not self._ensure_browser():
             raise RuntimeError('未登录，请先调用 login()')
 
+        # 检查 API Key（按章导出必须）
+        api_key = os.environ.get('WEREAD_API_KEY', '')
+        if not api_key:
+            print()
+            print('  ╔══════════════════════════════════════════════════════╗')
+            print('  ║  按章导出需要 API Key 来获取官方目录结构             ║')
+            print('  ║  请先运行 python weread_exporter.py --login          ║')
+            print('  ║  扫码登录后，按提示在个人中心 → 微信读书 Skill      ║')
+            print('  ║  生成 API Key 并粘贴，后续导出自动对齐章节。        ║')
+            print('  ╚══════════════════════════════════════════════════════╝')
+            print()
+            return []
+
         page = self._page
         self._log('打开阅读器...')
         page.goto(f'https://weread.qq.com/web/reader/{book_id}',
@@ -911,6 +924,20 @@ class WeReadExporter:
 
         # 构建 API TOC 对齐结构（用于 API+DOM 联合导航检测）
         aligned_chapters = []
+        # 自动获取 api_book_id（书架书无需用户传 --api-id）
+        if not api_book_id:
+            try:
+                shelf_books = get_shelf_full()
+                for sb in shelf_books:
+                    if book_title in sb.get('title', '') or sb.get('title', '') in book_title:
+                        api_book_id = sb.get('bookId')
+                        self._log(f'自动匹配 api_book_id={api_book_id}')
+                        break
+                if not api_book_id:
+                    self._log('书架中未匹配到当前书籍，使用 DOM 分类（如需精确范围请传 --api-id）')
+            except Exception as e:
+                self._log(f'自动获取 api_book_id 失败，回退 DOM 分类: {e}')
+
         # API TOC 覆盖：用官方 API 的 level 字段修正 DOM 分类
         if api_book_id:
             try:

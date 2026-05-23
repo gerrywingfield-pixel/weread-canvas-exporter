@@ -35,7 +35,7 @@ def cli_main():
     parser.add_argument('--range', type=str, metavar='N-M',
                         help='章节范围（配合 --skill 使用，如 "5-8"）')
     parser.add_argument('--api-id', type=str, metavar='API_BOOK_ID',
-                        help='REST API 数字 bookId（配合 --skill 用于搜索来的书，书架书无需此参数）')
+                        help='REST API 数字 bookId（配合 --skill 用于搜索来的书，书架书自动匹配）')
     parser.add_argument('--trial', choices=['y', 'n'], help='付费书策略: y=导出试读, n=跳过')
     parser.add_argument('--login', action='store_true', help='强制重新登录')
     parser.add_argument('--verbose', action='store_true', help='显示详细日志')
