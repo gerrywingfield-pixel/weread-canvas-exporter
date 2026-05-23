@@ -20,6 +20,7 @@
 
 import sys, time, os, re, json
 from collections import defaultdict
+from config.official_api import get_chapter_list
 
 from playwright.sync_api import sync_playwright
 
@@ -50,8 +51,12 @@ CANVAS_HOOK_JS = """
 """
 
 
-def _reassemble_page(texts):
-    """按坐标重组页面文本"""
+def _reassemble_page(texts, side=None):
+    """按坐标重组页面文本，含去重
+    side=None: 左右两侧（默认）
+    side='left': 仅左侧
+    side='right': 仅右侧
+    """
     if not texts:
         return []
     lines_dict = defaultdict(list)
@@ -59,7 +64,14 @@ def _reassemble_page(texts):
         matched = False
         for existing_y in list(lines_dict.keys()):
             if abs(existing_y - t['y']) <= 0:
-                lines_dict[existing_y].append(t)
+                # 去重：同一 y 坐标下，相同文本在相近 x 位置只保留一份
+                dupe = False
+                for et in lines_dict[existing_y]:
+                    if et['text'] == t['text'] and abs(et['x'] - t['x']) <= 5:
+                        dupe = True
+                        break
+                if not dupe:
+                    lines_dict[existing_y].append(t)
                 matched = True
                 break
         if not matched:
@@ -76,11 +88,56 @@ def _reassemble_page(texts):
             left_lines.append(left_text)
         if right_text:
             right_lines.append(right_text)
+    if side == 'left':
+        return left_lines
+    if side == 'right':
+        return right_lines
+    # side=None: 两侧完整输出
     result = list(left_lines)
     if left_lines and right_lines:
         result.append('')
     result.extend(right_lines)
     return result
+
+
+def _determine_start_side(raw, ch_title):
+    """判断从哪一侧开始写入（芯片浪潮页面判定）
+    返回 'left', 'right', 或 'all'
+    
+    规则：
+      1. 标题文字在左侧 → 左页是标题页 → 从 left 开始
+      2. 标题文字在右侧 → 右页是标题页 → 从 right 开始
+      3. 仅左侧为空（0 items）→ 左页是图片标题 → 从 left 开始
+      4. 仅右侧为空（0 items）→ 右页是图片标题 → 从 right 开始
+      5. 两侧都空 → 从左开始
+      6. 两侧都有内容且无标题文本 → 写全部
+    """
+    if not raw:
+        return 'left'
+    left_items = [t for t in raw if t['x'] < X_THRESHOLD]
+    right_items = [t for t in raw if t['x'] >= X_THRESHOLD]
+    norm_title = ch_title.replace('\u3000', ' ').strip()
+    left_text = ' '.join(t['text'] for t in left_items).replace('\u3000', ' ')
+    right_text = ' '.join(t['text'] for t in right_items).replace('\u3000', ' ')
+    # 进一步归一化：Canvas 可能每个字独立渲染，去掉所有空格再比
+    norm_left = left_text.replace(' ', '')
+    norm_right = right_text.replace(' ', '')
+    norm_title_stripped = norm_title.replace(' ', '')
+    # 规则1-2：标题文字定位
+    if norm_left and norm_title_stripped in norm_left:
+        return 'left'
+    if norm_right and norm_title_stripped in norm_right:
+        return 'right'
+    # 规则3-4：单侧为空（图片标题）
+    if not left_items and right_items:
+        return 'left'
+    if not right_items and left_items:
+        return 'right'
+    # 规则5：两侧空
+    if not left_items and not right_items:
+        return 'left'
+    # 规则6：两侧都有内容
+    return 'all'
 
 
 def _texts_identical(a, b):
@@ -283,6 +340,65 @@ def _navigate_to_chapter(page, ch_start, toc):
     time.sleep(2)
 
 
+# ========== TOC 对齐：API ↔ DOM ==========
+
+
+def _align_api_dom_toc(api_chapters, dom_classified):
+    """对齐 API TOC level-1 章节与 DOM TOC 索引
+
+    对每个 API level=1 章节，找到对应的 DOM TOC 索引，
+    并提取该章节下所有 API level=2 的子章节标题（用于入口检测）。
+
+    返回:
+        aligned: [{api_title, dom_index, sub_titles, chapterIdx}, ...]
+        按 DOM L1 顺序排列，与导引树编号对齐；无法匹配的 DOM 条目为 None
+    """
+    if not api_chapters or not dom_classified:
+        return []
+
+    # 获取 API 中 level=1 的章节
+    api_l1 = [c for c in api_chapters if c.get('level') == 1]
+
+    # 构建 API 标题 → 信息的映射
+    api_info_map = {}
+    for i, ac in enumerate(api_l1):
+        sub_titles = []
+        next_idx = api_l1[i + 1]['chapterIdx'] if i + 1 < len(api_l1) else 999999
+        for sc in api_chapters:
+            if sc.get('level') == 2 and sc['chapterIdx'] > ac['chapterIdx'] and sc['chapterIdx'] < next_idx:
+                sub_titles.append(sc['title'].strip())
+        api_info_map[ac['title'].strip()] = {
+            'api_title': ac['title'].strip(),
+            'sub_titles': sub_titles,
+            'chapterIdx': ac.get('chapterIdx'),
+        }
+
+    # 获取 DOM 中 level=1 的索引列表
+    dom_l1_indices = [c['index'] for c in dom_classified if c['level'] == '一级']
+
+    # 按 DOM L1 顺序建立对齐列表
+    aligned = []
+    for dom_idx in dom_l1_indices:
+        dom_title = dom_classified[dom_idx]['text'].strip()
+        matched = None
+        # 精确匹配
+        if dom_title in api_info_map:
+            matched = api_info_map[dom_title]
+        else:
+            # 子串匹配
+            for at, info in api_info_map.items():
+                if dom_title and (dom_title in at or at in dom_title):
+                    matched = info
+                    break
+        if matched:
+            aligned.append({**matched, 'dom_index': dom_idx})
+        else:
+            # 无法对齐的 DOM 条目（如扉页 vs 封面变体）
+            aligned.append(None)
+
+    return aligned
+
+
 # ========== WeReadExporter 类 ==========
 
 class WeReadExporter:
@@ -326,7 +442,7 @@ class WeReadExporter:
         self._p = sync_playwright().start()
         self._browser = self._p.chromium.launch(
             headless=self.headless,
-            args=['--disable-blink-features=AutomationControlled']
+            args=['--disable-blink-features=AutomationControlled', '--dns-servers=8.8.8.8']
         )
         self._context = self._browser.new_context(viewport={'width': 1280, 'height': 800})
         self._context.add_cookies([
@@ -348,7 +464,7 @@ class WeReadExporter:
         p = sync_playwright().start()
         browser = p.chromium.launch(
             headless=False,
-            args=['--disable-blink-features=AutomationControlled']
+            args=['--disable-blink-features=AutomationControlled', '--dns-servers=8.8.8.8']
         )
         ctx = browser.new_context(viewport={'width': 1280, 'height': 800})
         page = ctx.new_page()
@@ -406,6 +522,48 @@ class WeReadExporter:
             cookies = ctx.cookies()
             cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
             self._save_cookie(cookie_str)
+
+            # ── 获取 API Key（必须） ──
+            print()
+            print('  ╔══════════════════════════════════════════════╗')
+            print('  ║     请获取 API Key（必要性：章节边界判定）   ║')
+            print('  ║                                            ║')
+            print('  ║  本工具基于微信读书官方 Skill 生成，         ║')
+            print('  ║  具有官方 Skill 的全部功能。按章导出时       ║')
+            print('  ║  的章节边界判定（入口/出口检测）需要         ║')
+            print('  ║  API Key 获取官方目录结构。                 ║')
+            print('  ║                                            ║')
+            print('  ║  操作步骤：                                 ║')
+            print('  ║  ① 在浏览器中点击右上角头像                  ║')
+            print('  ║  ② 点击「微信读书Skill」                    ║')
+            print('  ║  ③ 首次使用→生成 API Key → 复制            ║')
+            print('  ║  ④ 将 API Key 粘贴到下方输入框              ║')
+            print('  ║                                            ║')
+            print('  ║  输入 N 可跳过（但不支持按章导出）           ║')
+            print('  ╚══════════════════════════════════════════════╝')
+            print()
+            # 导航到微信读书 Skill 页面
+            try:
+                page.goto('https://weread.qq.com/r/weread-skills',
+                          wait_until='domcontentloaded', timeout=15000)
+                time.sleep(3)
+            except:
+                pass  # 导航失败不阻塞，用户手动操作
+
+            api_key = input('  请输入 API Key（粘贴后按 Enter）: ').strip()
+            if api_key and api_key.upper() != 'N':
+                env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        'config', '.env')
+                os.makedirs(os.path.dirname(env_path), exist_ok=True)
+                with open(env_path, 'w') as f:
+                    f.write(f'WEREAD_API_KEY={api_key}\n')
+                self._log(f'API Key 已保存至 config/.env ({len(api_key)} 字符)')
+            else:
+                self._log('跳过 API Key 配置，按章导出功能受限')
+                print('  ⚠ 提示：需要 API Key 才能使用 --skill 按章导出功能。')
+                print('    整本导出 (--export) 不受影响。')
+                print()
+
             # 启动后台浏览器
             browser.close()
             p.stop()
@@ -657,7 +815,8 @@ class WeReadExporter:
         return out_file
 
     def export_chapters(self, book_id: str, chapter_range: str = None,
-                        output_dir: str = None, trial: str = None) -> list:
+                        output_dir: str = None, trial: str = None,
+                        api_book_id: str = None) -> list:
         """
         Skill 模式：按一级标题逐章导出（每个章节一个文件）。
 
@@ -708,11 +867,15 @@ class WeReadExporter:
             if trial == 'n':
                 self._log('用户取消导出（付费书跳过）')
                 return []
-            elif trial == 'y':
-                self._log('导出试读部分')
             else:
-                self._log('本书需要付费会员才能阅读完整内容，自动导出试读部分')
-
+                # 付费书且同意试读 → 直接复用整本试读导出，返回单文件列表
+                fp = self.export_book(book_id, output_dir=output_dir, trial='y')
+                if fp:
+                    base, ext = os.path.splitext(fp)
+                    trial_fp = f"{base}（试读部分）{ext}"
+                    os.rename(fp, trial_fp)
+                    return [trial_fp]
+                return []
         # 获取书名
         book_title = page.evaluate("""() => {
             var el = document.querySelector('.readerTopBar_title');
@@ -732,6 +895,42 @@ class WeReadExporter:
 
         # 分类
         classified = _classify_toc(toc_texts)
+
+        # 构建 API TOC 对齐结构（用于 API+DOM 联合导航检测）
+        aligned_chapters = []
+        # API TOC 覆盖：用官方 API 的 level 字段修正 DOM 分类
+        if api_book_id:
+            try:
+                api_chapters = get_chapter_list(api_book_id)
+                # 建立 API 标题 → level 映射（标题匹配而非索引对应）
+                api_level_map = {}
+                for ch in api_chapters:
+                    api_level_map[ch['title'].strip()] = '一级' if ch['level'] == 1 else '二级'
+                matched = 0
+                for c in classified:
+                    title = c['text'].strip()
+                    if title in api_level_map:
+                        c['level'] = api_level_map[title]
+                        matched += 1
+                    else:
+                        # 尝试子串匹配（DOM 可能截断或前后有空格差异）
+                        found = False
+                        for api_title, api_level in api_level_map.items():
+                            if title and (title in api_title or api_title in title):
+                                c['level'] = api_level
+                                matched += 1
+                                found = True
+                                break
+                        if not found:
+                            c['level'] = '二级'  # 未匹配视为细粒度子节
+                l1_count = sum(1 for c in classified if c['level'] == '一级')
+                self._log(f'API TOC 匹配 {matched}/{len(classified)} 条（含 {l1_count} 个一级）')
+                # 构建 API ↔ DOM 对齐（用于 API+DOM 联合导航）
+                aligned_chapters = _align_api_dom_toc(api_chapters, classified)
+                api_l1_count = sum(1 for a in aligned_chapters if a is not None)
+                self._log(f'API↔DOM 对齐: {api_l1_count} 个一级章节')
+            except Exception as e:
+                self._log(f'API TOC 获取失败，回退 DOM 分类: {e}')
 
         # 渲染导引树
         guide_tree, max_num = _render_guide_tree(classified)
@@ -789,121 +988,298 @@ class WeReadExporter:
 
         # 逐章导出
         output_files = []
+        # 构建对齐信息（API+DOM 联合导航）
+
+        # ── 导航到第一个目标章节的前一章（一次性） ──
+        first_ch_info = aligned_chapters[ch_start_num - 1] if aligned_chapters else None
+        if first_ch_info and first_ch_info.get('dom_index') is not None:
+            nav_dom_idx = max(0, first_ch_info['dom_index'] - 1)
+        else:
+            nav_dom_idx = max(0, first_level_list[ch_start_num - 1] - 1)
+        self._log(f'DOM 导航到 [{nav_dom_idx}] → ArrowRight...')
+        page.mouse.click(10, 10)
+        time.sleep(0.5)
+        page.click('.readerControls_item.catalog', timeout=5000)
+        time.sleep(2)
+        page.locator('.readerCatalog_list_item').nth(nav_dom_idx).click(timeout=5000)
+        time.sleep(3)
+        page.mouse.click(10, 10)
+        time.sleep(1)
+        page.evaluate('window._capturedTexts = []')
+
+        # ── 流式导出：所有章节共享一个 ArrowRight 循环 ──
+        ch_lines = []
+        total_pages = 0
+        chapter_entered = False
+        ch_page_num = 0
+        first_page_side = 'all'
+        prev_raw = None
+        same_count = 0
+        empty_pages = 0
+        page_buffer = []
+
+        active_ch_idx = ch_start_num - 1       # 当前章节在 range 内的索引
+        max_ch = min(ch_end_num, total_first) # 最后一个章节
+
+        # 初始化当前章节
+        # 初始化当前章节（流式导出：切换时调用）
+        def _setup_chapter(ch_i):
+            nonlocal ch_lines, chapter_entered, first_page_side, prev_raw
+            nonlocal same_count, empty_pages
+            ch_lines = []
+            chapter_entered = False
+            first_page_side = 'all'
+            prev_raw = None
+            same_count = 0
+            empty_pages = 0
+            toc_start = first_level_list[ch_i]
+            ct = classified[toc_start]['text']
+            safe_ch = re.sub(r'[\\/:*?"<>|]', '_', ct)[:80]
+            out_fp = os.path.join(book_dir, f'{safe_ch}.md')
+            ch_i_info = aligned_chapters[ch_i] if ch_i < len(aligned_chapters) else None
+
+            # 入口检测标题
+            et = [ct]
+            first_sub = None
+            if ch_i_info and ch_i_info['sub_titles']:
+                first_sub = ch_i_info['sub_titles'][0]
+                et.append(first_sub)
+
+            # 出口检测标题
+            next_et = None
+            if ch_i_info and ch_i + 1 < len(aligned_chapters) and aligned_chapters[ch_i + 1] is not None:
+                next_ch = aligned_chapters[ch_i + 1]
+                next_et = [next_ch['api_title']]
+                if next_ch['sub_titles']:
+                    next_et.append(next_ch['sub_titles'][0])
+
+            sub_count = len(ch_i_info['sub_titles']) if ch_i_info else 0
+            max_pages = max(300, sub_count * 200 + 50)
+
+            self._log(f'导出章节 [{ch_i - ch_start_num + 2}/{ch_end_num - ch_start_num + 1}]: {ct}')
+            print(f'  输出: {out_fp}')
+            return ct, out_fp, ch_i_info, et, first_sub, next_et, max_pages
+
+        ch_title, out_file, ch_info, entry_titles, first_sub_title, next_entry_titles, max_chapter_pages = _setup_chapter(active_ch_idx)
+
         try:
-            for ch_i in range(ch_start_num - 1, min(ch_end_num, total_first)):
-                toc_start = first_level_list[ch_i]
-                # 章节结束索引（下一个一级标题的前一个，或全书末尾）
-                if ch_i + 1 < total_first:
-                    toc_end = first_level_list[ch_i + 1] - 1
-                else:
-                    toc_end = len(toc_texts) - 1
-
-                ch_title = classified[toc_start]['text']
-                safe_ch = re.sub(r'[\\/:*?"<>|]', '_', ch_title)[:80]
-                out_file = os.path.join(book_dir, f'{safe_ch}.md')
-
-                self._log(f'导出章节 [{ch_i+1}/{ch_end_num-ch_start_num+1}]: {ch_title}')
-                print(f'  输出: {out_file}')
-
-                # 导航到章节
-                _navigate_to_chapter(page, toc_start, classified)
-
-                # 导出当前章节
-                ch_lines = []
-                total_pages = 0
-                prev_raw = None
-                same_count = 0
-                empty_pages = 0
-
-                # 首页捕获
-                first_raw = page.evaluate('window._capturedTexts') or []
-                page.evaluate('window._capturedTexts = []')
-                if first_raw:
-                    prev_raw = first_raw
-                    lines = _reassemble_page(first_raw)
-                    ch_lines.extend(lines)
-                    ch_lines.append('')
-                    total_pages += 1
-
-                for page_num in range(1, 99999):
+            for page_num in range(1, 99999):
+                # 页面操作可能因浏览器崩溃而失败，捕获异常后保存进度
+                try:
                     page.evaluate('window._capturedTexts = []')
                     page.keyboard.press('ArrowRight')
                     time.sleep(PAGE_SLEEP)
 
-                    result = page.evaluate("""() => {
+                    result = page.evaluate('''() => {
                         var texts = window._capturedTexts || [];
                         var paywall = false;
                         var el = document.querySelector('.need_pay_mask');
                         if (el && el.offsetParent !== null) paywall = true;
                         return {texts: texts, paywall: paywall};
-                    }""")
-                    raw = result['texts'] or []
-                    total_pages += 1
+                    }''')
+                except Exception as e:
+                    self._log(f'页面操作异常: {e}')
+                    # 保存当前章节进度
+                    if ch_lines and out_file not in output_files:
+                        with open(out_file, 'w', encoding='utf-8') as f:
+                            f.write(f'# {ch_title}\n\n')
+                            f.write('\n'.join(ch_lines))
+                        size = os.path.getsize(out_file)
+                        self._log(f'异常时已保存: {out_file} ({size/1024:.1f} KB)')
+                        output_files.append(out_file)
+                    break
+                raw = result['texts'] or []
+                total_pages += 1
+                ch_page_num += 1
 
-                    # 付费墙检测
-                    if result['paywall']:
-                        self._log('试读结束（付费墙）')
-                        break
+                page_buffer.append(raw)
+                if len(page_buffer) > 4:
+                    page_buffer.pop(0)
 
-                    # 章节结束检测：检查 DOM 标题是否已超出范围
-                    current_title = _get_chapter_title(page)
-                    if current_title:
-                        current_toc_idx = -1
-                        for t in classified:
-                            if current_title == t['text'] or (current_title in t['text']):
-                                current_toc_idx = t['index']
-                                break
-                        if current_toc_idx > toc_end:
-                            self._log(f'章节结束 (TOC索引 {current_toc_idx} > {toc_end})')
-                            break
+                if result['paywall']:
+                    self._log('试读结束（付费墙）')
+                    break
 
-                    # 空页处理
-                    if not raw:
-                        empty_pages += 1
-                        if empty_pages >= 8:
-                            self._log('全书完（连续8页无内容）')
-                            break
-                        continue
-                    empty_pages = 0
+                # ── 入口检测（DOM 章节标题） ──
+                if ch_info and not chapter_entered:
+                    current_dom_title = _get_chapter_title(page)
+                    entered = False
+                    matched_by_sub = False
 
-                    # 内容重复检测
-                    if prev_raw and _texts_identical(raw, prev_raw):
-                        same_count += 1
-                        if same_count >= CONSECUTIVE_EMPTY_LIMIT:
-                            self._log('章节结束（内容重复）')
-                            break
-                    else:
-                        same_count = 0
+                    # 1. 精确匹配 L1 标题
+                    if current_dom_title and (
+                        ch_title == current_dom_title or
+                        ch_title.replace(' ', '') == current_dom_title.replace(' ', '')
+                    ):
+                        entered = True
 
+                    # 2. 匹配首个子章节标题（芯片浪潮场景：图片标题页的后续子章节）
+                    if not entered and first_sub_title and current_dom_title:
+                        sub_norm = first_sub_title.replace(' ', '')
+                        dom_norm = current_dom_title.replace(' ', '')
+                        if sub_norm in dom_norm or dom_norm in sub_norm:
+                            entered = True
+                            matched_by_sub = True
+
+                    if entered:
+                        chapter_entered = True
+                        self._log(f'进入章节: {ch_title} (DOM: {current_dom_title})')
+                        first_page_side = _determine_start_side(raw, ch_title)
+
+                        if matched_by_sub:
+                            # 子章节触发：缓冲回写
+                            prev_ch_content_markers = []
+                            if active_ch_idx > 0:
+                                prev_info = aligned_chapters[active_ch_idx - 1]
+                                if prev_info:
+                                    prev_ch_content_markers.append(prev_info['api_title'].replace(' ', ''))
+                                    if prev_info['sub_titles']:
+                                        prev_ch_content_markers.append(
+                                            prev_info['sub_titles'][0].replace(' ', ''))
+                            for buf_raw in page_buffer[:-1]:
+                                if buf_raw:
+                                    buf_nospace = ''.join(t['text'] for t in buf_raw).replace('\u200b', '')
+                                    is_prev = (prev_ch_content_markers and
+                                               any(m in buf_nospace for m in prev_ch_content_markers))
+                                    if not is_prev and buf_nospace.strip():
+                                        page_lines = _reassemble_page(buf_raw)
+                                        if page_lines:
+                                            ch_lines.extend(page_lines)
+                                            ch_lines.append('')
+
+                        page_lines = _reassemble_page(raw)
+                        if page_lines:
+                            ch_lines.extend(page_lines)
+                            ch_lines.append('')
+                        prev_raw = raw
+                    continue
+
+                # 入口检测（fallback：无 API 信息）
+                if not ch_info and not chapter_entered:
+                    chapter_entered = True
+                    first_page_side = 'all'
                     if raw:
                         page_lines = _reassemble_page(raw)
                         if page_lines:
                             ch_lines.extend(page_lines)
                             ch_lines.append('')
                         prev_raw = raw
+                    continue
 
-                    # 每 50 页写入一次
-                    if page_num % 50 == 0:
-                        with open(out_file, 'w', encoding='utf-8') as f:
-                            f.write(f'# {ch_title}\n\n')
-                            f.write('\n'.join(ch_lines))
+                # ── 出口检测（DOM 章节标题变化） ──
+                if chapter_entered and next_entry_titles and raw:
+                    current_dom_title = _get_chapter_title(page)
+                    if current_dom_title:
+                        exit_detected = False
+                        for net in next_entry_titles:
+                            net_norm = net.replace(' ', '')
+                            dom_norm = current_dom_title.replace(' ', '')
+                            if net_norm in dom_norm or dom_norm in net_norm:
+                                exit_detected = True
+                                break
+                        if exit_detected:
+                            self._log(f'章节结束: {ch_title} (DOM: {current_dom_title}) (matches: {net})')
+                            # 清理过渡页：混入 ch_lines 的下一章标题及后续内容（双页展示中下一页的右半部分）
+                            if prev_raw and net:
+                                net_nospace = net.replace(' ', '').replace('\u200b', '')
+                                # 标题可能在Canvas中跨行（如"第六卷 一般理论所引发的若干"+"短论"）
+                                # 用标题前6个无空格字符作为标识（足够唯一辨识）
+                                net_key = net_nospace[:6]
+                                cut_idx = None
+                                for i in range(len(ch_lines) - 1, -1, -1):
+                                    line_nospace = ch_lines[i].replace(' ', '').replace('\u200b', '')
+                                    if net_key in line_nospace:
+                                        cut_idx = i
+                                        break
+                                if cut_idx is not None:
+                                    ch_lines = ch_lines[:cut_idx]
+                                    # 不补回过渡页左半部分：该内容已在上一页全页捕获时写入
+                            with open(out_file, 'w', encoding='utf-8') as f:
+                                f.write(f'# {ch_title}\n\n')
+                                f.write('\n'.join(ch_lines))
+                            size = os.path.getsize(out_file)
+                            self._log(f'已完成: {out_file} ({size/1024:.1f} KB)')
+                            output_files.append(out_file)
 
-                # 保存章节文件
+                            # 切换到下一个章节
+                            active_ch_idx += 1
+                            if active_ch_idx >= max_ch:
+                                break
+                            ch_title, out_file, ch_info, entry_titles, first_sub_title, next_entry_titles, max_chapter_pages = _setup_chapter(active_ch_idx)
+                            page_buffer = []
+                            ch_page_num = 0
+                            # 当前页内容已包含下一章节标题，直接标记进入
+                            chapter_entered = True
+                            first_page_side = _determine_start_side(raw, ch_title)
+                            # 写入标题页内容（非空时）
+                            if raw:
+                                page_lines = _reassemble_page(raw)
+                                if page_lines:
+                                    ch_lines.extend(page_lines)
+                                    ch_lines.append('')
+                                prev_raw = raw
+                            continue
+
+                # 空页处理
+                if not raw:
+                    empty_pages += 1
+                    if empty_pages >= 8:
+                        self._log('全书完（连续8页无内容）')
+                        break
+                    continue
+                empty_pages = 0
+
+                # 内容重复检测
+                if prev_raw and _texts_identical(raw, prev_raw):
+                    same_count += 1
+                    if same_count >= CONSECUTIVE_EMPTY_LIMIT:
+                        self._log('章节结束（内容重复）')
+                        break
+                else:
+                    same_count = 0
+
+                # 写入内容
+                if raw and chapter_entered:
+                    page_lines = _reassemble_page(raw)
+                    if page_lines:
+                        ch_lines.extend(page_lines)
+                        ch_lines.append('')
+                    prev_raw = raw
+
+                # 章节页数上限（防止出口检测漏掉时无限翻页）
+                if chapter_entered and ch_page_num > max_chapter_pages:
+                    self._log(f'章节结束（达页数上限 {max_chapter_pages}）: {ch_title}')
+                    break
+
+                if page_num % 50 == 0 and ch_lines:
+                    with open(out_file, 'w', encoding='utf-8') as f:
+                        f.write(f'# {ch_title}\n\n')
+                        f.write('\n'.join(ch_lines))
+
+            # 保存最后一个章节
+            if ch_lines and out_file not in output_files:
                 with open(out_file, 'w', encoding='utf-8') as f:
                     f.write(f'# {ch_title}\n\n')
                     f.write('\n'.join(ch_lines))
-
                 size = os.path.getsize(out_file)
-                self._log(f'章节完成: {out_file} ({size/1024:.1f} KB, {total_pages} 页)')
+                self._log(f'已完成: {out_file} ({size/1024:.1f} KB)')
                 output_files.append(out_file)
 
-                # 章节间暂停，避免风控
-                time.sleep(2)
-
         except KeyboardInterrupt:
-            if output_files:
+            if ch_lines:
+                with open(out_file, 'w', encoding='utf-8') as f:
+                    f.write(f'# {ch_title}\n\n')
+                    f.write('\n'.join(ch_lines))
                 self._log(f'已保存 {len(output_files)} 个章节文件')
             return output_files
+
+        # 关闭页面释放资源
+        try:
+            page.close()
+        except:
+            pass
+        self._log('全部完成，歇 8 秒释放资源...')
+        time.sleep(8)
 
         self._log(f'全部导出完成: {len(output_files)} 个章节文件')
         return output_files

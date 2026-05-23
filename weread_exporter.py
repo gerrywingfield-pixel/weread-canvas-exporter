@@ -34,6 +34,8 @@ def cli_main():
                         help='Skill模式：按章节导出，显示导引树，每章一个文件')
     parser.add_argument('--range', type=str, metavar='N-M',
                         help='章节范围（配合 --skill 使用，如 "5-8"）')
+    parser.add_argument('--api-id', type=str, metavar='API_BOOK_ID',
+                        help='REST API 数字 bookId（配合 --skill 用于搜索来的书，书架书无需此参数）')
     parser.add_argument('--trial', choices=['y', 'n'], help='付费书策略: y=导出试读, n=跳过')
     parser.add_argument('--login', action='store_true', help='强制重新登录')
     parser.add_argument('--verbose', action='store_true', help='显示详细日志')
@@ -71,7 +73,7 @@ def cli_main():
                 sys.exit(1)
         elif args.skill:
             files = exporter.export_chapters(args.skill, chapter_range=args.range,
-                                              trial=args.trial)
+                                              trial=args.trial, api_book_id=args.api_id)
             if files:
                 print('\n导出完成:', flush=True)
                 for f in files:

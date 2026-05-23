@@ -12,9 +12,19 @@ venv/
 # 隐私文件
 cookie.txt
 cookie.txt.bak
+config/.env
 
 # 导出文件
 output/
+
+# 日志
+logs/
+
+# 调试/测试脚本（非生产）
+debug_nav*.py
+export_keynes.py
+export_simple.py
+_test_book.py
 
 # 系统文件
 .DS_Store
