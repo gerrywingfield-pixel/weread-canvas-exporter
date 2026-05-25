@@ -7,9 +7,10 @@
 ## 目录
 
 - [不是什么 / 是什么](#不是什么--是什么)
+- [完整工作流（推荐）](#完整工作流推荐)
 - [快速开始（5分钟）](#快速开始5分钟)
-- [两种使用方式](#两种使用方式)
 - [CLI 命令参考](#cli-命令参考)
+- [后处理排版](#后处理排版)
 - [导出文件在哪里](#导出文件在哪里)
 - [常见问题](#常见问题)
 - [风险提示](#风险提示)
@@ -25,11 +26,53 @@
 - 不建议导漫画、绘本或纯图片书籍（Canvas Hook 抓不到图片里的文字）
 
 **是什么**：
-- 让 **AI 能"读"微信读书里的书**——输出 Markdown 格式，直接喂给 LLM
-- 基于微信读书官方 Skill（[weread.qq.com/r/weread-skills](https://weread.qq.com/r/weread-skills)）二次开发，**具有官方 Skill 的全部功能**（搜索、书架、目录获取），叠加了逐页正文捕获和按章导出能力
+- 让 **AI 能"读"微信读书里的书**——输出结构化 Markdown，直接喂给 LLM
+- 基于微信读书官方 Skill（[weread.qq.com/r/weread-skills](https://weread.qq.com/r/weread-skills)）二次开发，**具有官方 Skill 的全部功能**（搜索、书架、目录获取），叠加了逐页正文捕获和后处理排版能力
 - 不破解付费：付费书只导出试读部分到付费墙为止
+- **两步产出**：①全书导出为纯文本 → ②后处理排版（去除非正文 + 按 API 目录结构化）
+
+> 💡 **推荐在 AI Agent 上使用**：本项目的 Skill 版本（Hermes Agent skill）提供完整的编排能力——搜索选书、版本确认、付费提示、后台导出、排版交付一条龙。纯 CLI 操作适合简单场景，用 Agent 编排才能发挥完整功能。
 
 ---
+
+---
+
+## 完整工作流（推荐）
+
+```bash
+# 1. 查书架 → 选书
+python weread_exporter.py --list
+
+# 2. 全书导出到纯文本（后台运行，自动通知完成）
+python weread_exporter.py --export <readerId>
+
+# 3. 目录核验（扫描 API 目录 vs 全文匹配，识别图片标题页和级联删除风险）
+python scripts/format_export.py <bookId> --verify
+
+# 4. 排版输出（去除非正文 + 按层级添加 Markdown 标题）
+python scripts/format_export.py <bookId>
+```
+
+输出示例：
+```
+=== 目录核验：API标题 vs 全文匹配 ===
+  ✅ [L1] 版权信息
+  ✅ [L1] 推荐序
+  ❌ [L1] 第一篇 筚路蓝缕 以启山林   ← 图片装饰页，安全
+  ✅ [L2]   第一章 豆浆店谈出"芯"产业
+  ✅ [L2]   第二章 56岁的创业者
+  ...
+  匹配成功: 19/25
+  疑似图片标题: 6/25
+  ✅ 无级联删除风险
+
+✅ 排版完成: output/芯片浪潮：纳米工艺背后的全球竞争_排版版.md
+   保留 15 章, 排除 4 章
+   共 11046 行 / 226KB
+```
+
+---
+
 ---
 
 ## 快速开始（5分钟）
@@ -78,59 +121,10 @@ python weread_exporter.py --login
 3. 登录成功后自动跳转到 **微信读书 Skill** 页面
 4. 点击头像 → 「微信读书 Skill」 → **生成 API Key** → 粘贴到终端
 
-> **为什么要 API Key？** 按章节导出（`--skill`）需要它来获取官方目录结构，做章节边界判定。整本导出（`--export`）不需要 API Key，自上传书籍也走整本导出。
->
 > `--login` 一次扫码完成两件事：Cookie 写入 `cookie.txt` + API Key 写入 `config/.env`。以后不需要重新登录。
 
 ---
----
 
-## 两种使用方式
-
-### 方式一：整本导出（一键，不需要 API Key）
-
-```bash
-python weread_exporter.py --export <readerId>
-```
-
-适合场景：快速把整本书导出给 AI 分析，不在乎分不分章节。
-
-**流程**：打开阅读器 → 检测付费 → ArrowRight 逐页翻 → 导出全书为一个 `.md` 文件。
-
-### 方式二：按章导出（精细化，需要 API Key）
-
-**书架书** 和 **搜索来的书** 都用同一命令：
-```bash
-python weread_exporter.py --skill <readerId> --range 5-8
-```
-`api_book_id` 自动匹配（书架→搜索，两级兜底），极少数搜不到时加 `--api-id <数字bookId>`。
-
-适合场景：只想导正文（跳过推荐序、版权页等非原著内容），或只导指定的某几章。
-
-**流程**：
-1. 展示导引树（列出所有一级标题）
-2. 输入要导出的章节范围
-3. 每章输出一个独立 `.md` 文件
-
-### 如何获取 readerId？
-
-| 来源 | readerId |
-|:-----|:---------|
-| 书架上的书 | `--list` 直接拿到 |
-| 搜索来的书 | 浏览器搜索后点进去拿 |
-
-**按章导出无需手动获取 api_book_id**，代码自动从书架或搜索 API 匹配。仅极少数搜不到时需 `--api-id` 手动指定。
-
-**按章导出**（书架书和搜索来的书通用）：
-```bash
-# 1. 列出书架（或浏览器搜索获取 readerId）
-python weread_exporter.py --list
-
-# 2. 直接导出（api_book_id 自动匹配，无需手动传）
-python weread_exporter.py --skill <readerId> --range 5-8
-```
-
----
 ---
 
 ## CLI 命令参考
@@ -142,9 +136,9 @@ python weread_exporter.py --skill <readerId> --range 5-8
 | `--export <readerId>` | 整本导出（自动判定付费） | ❌ |
 | `--export <readerId> --trial y` | 强制试读导出 | ❌ |
 | `--export <readerId> --trial n` | 付费书跳过 | ❌ |
-| `--skill <readerId> --range N-M` | 按章导出（自动匹配，书架+搜索都支持） | ✅ |
-| `--skill <readerId> --range N-M --api-id <id>` | 按章导出（搜不到时手动兜底） | ✅ |
 | `--verbose` | 显示详细翻页日志 | 随主命令 |
+
+> 按章导出（`--skill`）已废弃，统一使用全书导出 + 后处理排版。
 
 ### 使用示例
 
@@ -158,23 +152,52 @@ python weread_exporter.py --list
 # 整本导出
 python weread_exporter.py --export d6632d705cf769d6646fc55
 
-# 按章导出第5-8章（书架书）
-python weread_exporter.py --skill d6632d705cf769d6646fc55 --range 5-8
-
-# 按章导出一章（搜索来的书）
-python weread_exporter.py --skill 48d32cc0813ab80f8g015eec --range 5-5 --api-id 3300067765
+# 后处理排版
+python scripts/format_export.py 3300067765 --verify  # 先核验
+python scripts/format_export.py 3300067765            # 再排版
 ```
 
 ---
+
+---
+
+## 后处理排版
+
+导出后的纯文本经过 `scripts/format_export.py` 加工，产出符合目录结构的 Markdown。
+
+### 两步走
+
+```bash
+# 第①步：目录核验
+python scripts/format_export.py <bookId> --verify
+
+# 第②步：排版输出
+python scripts/format_export.py <bookId>
+```
+
+### 功能
+
+1. **目录核验** — 用 API `get_chapter_list()` 获取官方目录，逐条在全文搜索匹配，分类报告：
+   - ✅ 正常匹配 → 走排版
+   - ⚠️ 交叉引用过滤 → 检查顺序约束
+   - ❌ 全文无匹配 → 图片标题页/装饰页（识别级联删除风险）
+
+2. **排除非正文** — 自动剔除封面、版权信息、推荐序、附录等三方撰写内容；保留引言、自序、作者正文
+
+3. **Markdown 结构化** — 按 `#`(L1) → `##`(L2) 层级编排
+
+4. **级联删除保护** — 图片标题章节不会被相邻排除章节吞掉
+
+---
+
 ---
 
 ## 导出文件在哪里
 
-| 导出方式 | 输出路径 |
-|:---------|:---------|
-| 整本导出 | `output/书名/书名.md` |
-| 按章导出 | `output/书名/第五章 标题.md` |
-| 付费书试读 | `output/书名/书名（试读部分）.md` |
+| 产出 | 路径 | 说明 |
+|:-----|:-----|:-----|
+| 全文导出 | `output/书名 - 作者名/书名 - 作者名.md` | 原始纯文本 |
+| 排版版 | `output/书名 - 作者名/书名 - 作者名_排版版.md` | 结构化 Markdown |
 
 复制到 Windows 桌面：
 ```bash
@@ -183,25 +206,6 @@ cp output/* /mnt/c/Users/你的用户名/Desktop/ -r
 
 ---
 
----
-
-## 多 Agent 能力
-
-本工具理论上支持多 Agent 并行协作，让 AI 代理独立工作，互不干扰。典型场景：
-
-| 场景 | 说明 |
-|:-----|:------|
-| **多 Agent 导不同书** | 每个 Agent 登录不同微信读书账号，各自导出不同的书，互不影响 |
-| **多 Agent 导同一本书** | 拆分为多个章节范围，分配给不同 Agent 并行导出，大幅缩短单本书的导出耗时 |
-
-技术上可行，但需要注意：
-- 每个 Agent 需使用**独立的微信读书账号**（同一账号多端操作可能触发风控）
-- 每个 Agent 有自己的 Cookie 和 API Key，互不干扰
-- 导出完成后由下游调度 Agent 合并结果
-
-> 欢迎社区在这方面继续探索。如果你实现了更好的多 Agent 编排方案，欢迎提交 Issue 或 PR。
-
----
 ---
 
 ## 常见问题
@@ -214,11 +218,20 @@ cp output/* /mnt/c/Users/你的用户名/Desktop/ -r
 
 按 **Ctrl+C**，已导出的内容自动保存，不会丢失。
 
+### 排版版和原始导出有什么区别？
+
+| | 原始导出 | 排版版 |
+|:---|:---------|:-------|
+| 结构 | 纯平铺文本，无章节标题 | 按 `#` → `##` 层级组织 |
+| 非正文（版权/推荐序） | 混在文件中 | 自动剔除 |
+| 跨行标题 | 换行打断 | 用 API 目录重建 |
+| AI 阅读 | 可以读，但无结构 | 可跳章节、按章摘要 |
+
 ### 导出的内容不全？
 
 - 图片/表格内的文字无法捕获（Canvas Hook 的固有限制）
 - 付费书只能导到试读部分
-- 如果使用按章导出，检查 `--range` 参数是否正确——导引树中的编号可能比直觉少（扉页等不计编号）
+- 图片装饰标题页（纯 `drawImage`）无文字捕获，`--verify` 可识别
 
 ### Cookie 过期了？
 
@@ -243,11 +256,8 @@ source venv/bin/activate
 # 继续用，cookie 还在
 ```
 
-### 可以同时导多本书吗？
-
-**同一账号不建议**——多终端同步翻页可能触发风控。不同账号各自一个终端安全。
-
 ---
+
 ---
 
 ## 风险提示
@@ -278,10 +288,11 @@ source venv/bin/activate
 ### ⚠️ 技术局限性
 
 - Canvas Hook 无法捕获图片/表格内的文字
+- 全页装饰图片标题页（`drawImage` 渲染）无文字捕获，排版时 `--verify` 会标记
 - WSL 环境长时间运行 Chromium 存在稳定性风险
-- 导出速度受微信读书页面渲染速度和翻页间隔限制，无法加速
 
 ---
+
 ---
 
 ## 文件结构
@@ -292,6 +303,8 @@ weread-canvas-exporter/
 ├── weread_core.py           # 核心导出引擎（Python API）
 ├── config/
 │   └── official_api.py      # 微信读书官方 REST API 封装
+├── scripts/
+│   └── format_export.py     # 后处理排版工具（核验 + 结构化）
 ├── install.sh               # 一键安装脚本
 ├── requirements.txt         # Python 依赖
 ├── AGENTS.md                # AI Agent 上下文说明
@@ -300,6 +313,8 @@ weread-canvas-exporter/
 ├── config/.env              # API Key（自动生成，排除在 Git 外）
 └── output/                  # 导出结果（排除在 Git 外）
 ```
+
+---
 
 ---
 

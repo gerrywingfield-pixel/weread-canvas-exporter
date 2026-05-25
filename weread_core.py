@@ -20,7 +20,7 @@
 
 import sys, time, os, re, json
 from collections import defaultdict
-from config.official_api import get_chapter_list, get_shelf_full, search
+from config.official_api import get_book_info, get_chapter_list, get_shelf_full, search
 
 from playwright.sync_api import sync_playwright
 
@@ -147,6 +147,24 @@ def _texts_identical(a, b):
         if t1['text'] != t2['text'] or abs(t1['x'] - t2['x']) > 5:
             return False
     return True
+
+
+def _normalize_text(text):
+    """去除所有 Unicode 空白字符和零宽字符"""
+    import re
+    return re.sub(r'[\s\u200b\u200c\u200d\ufeff\u00a0]', '', str(text))
+
+
+def _canvas_matches_title(raw, title):
+    """检查 Canvas 文字（两侧）是否完全包含目标标题（归一化后）"""
+    if not raw or not title:
+        return False
+    canvas_text = ''.join(t['text'] for t in raw)
+    norm_canvas = _normalize_text(canvas_text)
+    norm_title = _normalize_text(title)
+    if not norm_canvas or not norm_title:
+        return False
+    return norm_title in norm_canvas
 
 
 def _get_chapter_title(page):
@@ -333,13 +351,7 @@ def _navigate_to_chapter(page, ch_start, toc):
         page.keyboard.press('ArrowRight')
         time.sleep(1.5)
 
-    # 强制首页重绘
-    page.keyboard.press('ArrowLeft')
-    time.sleep(2)
-    page.keyboard.press('ArrowRight')
-    time.sleep(2)
-
-
+    # 关闭目录
 # ========== TOC 对齐：API ↔ DOM ==========
 
 
@@ -715,6 +727,23 @@ class WeReadExporter:
             return el ? el.textContent.trim() : '未命名书籍';
         }""")
 
+        # 获取作者（直接通过 API 获取）
+        book_author = ''
+        try:
+            info = get_book_info(book_id)
+            book_author = info.get('author', '') or ''
+        except Exception:
+            # 兜底：book_id 可能是 readerId，尝试匹配书架
+            try:
+                shelf = get_shelf_full()
+                for b in shelf:
+                    if b.get('readerId') == book_id:
+                        info = get_book_info(str(b['bookId']))
+                        book_author = info.get('author', '') or ''
+                        break
+            except Exception:
+                pass
+
         # 导航到 TOC[1]（版权信息）
         page.mouse.click(10, 10)
         time.sleep(0.5)
@@ -726,8 +755,21 @@ class WeReadExporter:
         page.mouse.click(10, 10)
         time.sleep(1)
 
-        # 准备输出
-        safe_title = re.sub(r'[\\/:*?"<>|]', '_', book_title)
+        # 最终兜底：从版权信息页文本提取作者
+        if not book_author:
+            try:
+                page_text = page.evaluate('window._capturedTexts') or []
+                for line in page_text:
+                    if isinstance(line, str) and line.startswith('作者：'):
+                        book_author = line.replace('作者：', '').strip()
+                        break
+                page.evaluate('window._capturedTexts = []')
+            except Exception:
+                pass
+
+        # 准备输出（书名 + 作者）
+        author_suffix = f' - {book_author}' if book_author else ''
+        safe_title = re.sub(r'[\\/:*?"<>|]', '_', book_title + author_suffix)
         out_dir = output_dir or OUTPUT_DIR
         book_dir = os.path.join(out_dir, safe_title)
         os.makedirs(book_dir, exist_ok=True)
@@ -919,7 +961,25 @@ class WeReadExporter:
             var el = document.querySelector('.readerTopBar_title');
             return el ? el.textContent.trim() : '未命名书籍';
         }""")
-        safe_title = re.sub(r'[\\/:*?"<>|]', '_', book_title)
+
+        # 获取作者（API 方式）
+        book_author = ''
+        try:
+            info = get_book_info(book_id)
+            book_author = info.get('author', '') or ''
+        except Exception:
+            try:
+                shelf = get_shelf_full()
+                for b in shelf:
+                    if b.get('readerId') == book_id:
+                        info = get_book_info(str(b['bookId']))
+                        book_author = info.get('author', '') or ''
+                        break
+            except Exception:
+                pass
+
+        author_suffix = f' - {book_author}' if book_author else ''
+        safe_title = re.sub(r'[\\/:*?"<>|]', '_', book_title + author_suffix)
         out_dir = output_dir or OUTPUT_DIR
         book_dir = os.path.join(out_dir, safe_title)
         os.makedirs(book_dir, exist_ok=True)
@@ -1112,6 +1172,7 @@ class WeReadExporter:
         same_count = 0
         empty_pages = 0
         page_buffer = []
+        ch_lines_len_before_append = 0
 
         active_ch_idx = ch_start_num - 1       # 当前章节在 range 内的索引
         max_ch = min(ch_end_num, total_first) # 最后一个章节
@@ -1146,12 +1207,13 @@ class WeReadExporter:
                 next_ch = aligned_chapters[ch_i + 1]
                 next_et = [next_ch['api_title']]
                 if next_ch['sub_titles']:
-                    next_et.append(next_ch['sub_titles'][0])
+                    next_et.extend(next_ch['sub_titles'])
 
             sub_count = len(ch_i_info['sub_titles']) if ch_i_info else 0
             max_pages = max(300, sub_count * 200 + 50)
 
             self._log(f'导出章节 [{ch_i - ch_start_num + 2}/{ch_end_num - ch_start_num + 1}]: {ct}')
+            self._log(f'  ch_i={ch_i} ch_i_info={"有" if ch_i_info else "无"} aligned_len={len(aligned_chapters)} next_et={next_et}')
             print(f'  输出: {out_fp}')
             return ct, out_fp, ch_i_info, et, first_sub, next_et, max_pages
 
@@ -1195,58 +1257,75 @@ class WeReadExporter:
                     self._log('试读结束（付费墙）')
                     break
 
-                # ── 入口检测（DOM 章节标题） ──
+# ── 入口检测（Canvas 文字匹配章节标题） ──
                 if ch_info and not chapter_entered:
                     current_dom_title = _get_chapter_title(page)
                     entered = False
-                    matched_by_sub = False
 
-                    # 1. 精确匹配 L1 标题
-                    if current_dom_title and (
-                        ch_title == current_dom_title or
-                        ch_title.replace(' ', '') == current_dom_title.replace(' ', '')
-                    ):
-                        entered = True
-
-                    # 2. 匹配首个子章节标题（芯片浪潮场景：图片标题页的后续子章节）
-                    if not entered and first_sub_title and current_dom_title:
-                        sub_norm = first_sub_title.replace(' ', '')
-                        dom_norm = current_dom_title.replace(' ', '')
-                        if sub_norm in dom_norm or dom_norm in sub_norm:
-                            entered = True
-                            matched_by_sub = True
+                    # 确认DOM变了：DOM标题匹配目标章节
+                    if current_dom_title:
+                        for et in entry_titles:
+                            net = _normalize_text(et)
+                            ndom = _normalize_text(current_dom_title)
+                            if ndom and (net == ndom or net in ndom or ndom in net):
+                                entered = True
+                                break
 
                     if entered:
-                        chapter_entered = True
-                        self._log(f'进入章节: {ch_title} (DOM: {current_dom_title})')
-                        first_page_side = _determine_start_side(raw, ch_title)
+                        if _canvas_matches_title(raw, ch_title):
+                            # 【情况①】Canvas匹配 → 标题在左页
+                            # 左右都是新章节内容，直接导出两侧
+                            chapter_entered = True
+                            self._log(f'进入章节: {ch_title} (Canvas匹配)')
+                            first_page_side = 'all'
+                            ch_lines_len_before_append = len(ch_lines)
+                            page_lines = _reassemble_page(raw)
+                            if page_lines:
+                                ch_lines.extend(page_lines)
+                                ch_lines.append('')
+                            prev_raw = raw
+                        else:
+                            # Canvas不匹配 → ArrowLeft回退到过渡屏
+                            self._log('入口检测: DOM变了但Canvas未匹配，ArrowLeft回退')
+                            page.evaluate('window._capturedTexts = []')
+                            page.keyboard.press('ArrowLeft')
+                            time.sleep(PAGE_SLEEP)
+                            check_raw = page.evaluate(
+                                '() => { var t = window._capturedTexts || []; '
+                                'window._capturedTexts = []; return t; }'
+                            ) or []
 
-                        if matched_by_sub:
-                            # 子章节触发：缓冲回写
-                            prev_ch_content_markers = []
-                            if active_ch_idx > 0:
-                                prev_info = aligned_chapters[active_ch_idx - 1]
-                                if prev_info:
-                                    prev_ch_content_markers.append(prev_info['api_title'].replace(' ', ''))
-                                    if prev_info['sub_titles']:
-                                        prev_ch_content_markers.append(
-                                            prev_info['sub_titles'][0].replace(' ', ''))
-                            for buf_raw in page_buffer[:-1]:
-                                if buf_raw:
-                                    buf_nospace = ''.join(t['text'] for t in buf_raw).replace('\u200b', '')
-                                    is_prev = (prev_ch_content_markers and
-                                               any(m in buf_nospace for m in prev_ch_content_markers))
-                                    if not is_prev and buf_nospace.strip():
-                                        page_lines = _reassemble_page(buf_raw)
-                                        if page_lines:
-                                            ch_lines.extend(page_lines)
-                                            ch_lines.append('')
-
-                        page_lines = _reassemble_page(raw)
-                        if page_lines:
-                            ch_lines.extend(page_lines)
-                            ch_lines.append('')
-                        prev_raw = raw
+                            if _canvas_matches_title(check_raw, ch_title):
+                                # 【②-a-1】标题在过渡屏右页
+                                # 从右页开始导出（左页是上一章尾）
+                                chapter_entered = True
+                                self._log(f'进入章节: {ch_title} (过渡屏右侧匹配)')
+                                first_page_side = 'right'
+                                ch_lines_len_before_append = len(ch_lines)
+                                right_lines = _reassemble_page(check_raw, side='right')
+                                if right_lines:
+                                    ch_lines.extend(right_lines)
+                                    ch_lines.append('')
+                                prev_raw = check_raw
+                            else:
+                                # 【②-a-2】图片标题
+                                # ArrowRight前进一页 → 从左边页导出
+                                page.keyboard.press('ArrowRight')
+                                time.sleep(PAGE_SLEEP)
+                                chapter_entered = True
+                                self._log(f'进入章节: {ch_title} (图片标题，从左边页开始)')
+                                first_page_side = 'left'
+                                new_raw = page.evaluate(
+                                    '() => { var t = window._capturedTexts || []; '
+                                    'window._capturedTexts = []; return t; }'
+                                ) or []
+                                ch_lines_len_before_append = len(ch_lines)
+                                if new_raw:
+                                    page_lines = _reassemble_page(new_raw)
+                                    if page_lines:
+                                        ch_lines.extend(page_lines)
+                                        ch_lines.append('')
+                                    prev_raw = new_raw
                     continue
 
                 # 入口检测（fallback：无 API 信息）
@@ -1254,6 +1333,7 @@ class WeReadExporter:
                     chapter_entered = True
                     first_page_side = 'all'
                     if raw:
+                        ch_lines_len_before_append = len(ch_lines)
                         page_lines = _reassemble_page(raw)
                         if page_lines:
                             ch_lines.extend(page_lines)
@@ -1261,34 +1341,27 @@ class WeReadExporter:
                         prev_raw = raw
                     continue
 
-                # ── 出口检测（DOM 章节标题变化） ──
-                if chapter_entered and next_entry_titles and raw:
+# ── 出口检测（Canvas 文字匹配下一章节标题） ──
+                if chapter_entered and next_entry_titles:
                     current_dom_title = _get_chapter_title(page)
-                    if current_dom_title:
-                        exit_detected = False
-                        for net in next_entry_titles:
-                            net_norm = net.replace(' ', '')
-                            dom_norm = current_dom_title.replace(' ', '')
-                            if net_norm in dom_norm or dom_norm in net_norm:
-                                exit_detected = True
-                                break
-                        if exit_detected:
-                            self._log(f'章节结束: {ch_title} (DOM: {current_dom_title}) (matches: {net})')
-                            # 清理过渡页：混入 ch_lines 的下一章标题及后续内容（双页展示中下一页的右半部分）
-                            if prev_raw and net:
-                                net_nospace = net.replace(' ', '').replace('\u200b', '')
-                                # 标题可能在Canvas中跨行（如"第六卷 一般理论所引发的若干"+"短论"）
-                                # 用标题前6个无空格字符作为标识（足够唯一辨识）
-                                net_key = net_nospace[:6]
-                                cut_idx = None
-                                for i in range(len(ch_lines) - 1, -1, -1):
-                                    line_nospace = ch_lines[i].replace(' ', '').replace('\u200b', '')
-                                    if net_key in line_nospace:
-                                        cut_idx = i
-                                        break
-                                if cut_idx is not None:
-                                    ch_lines = ch_lines[:cut_idx]
-                                    # 不补回过渡页左半部分：该内容已在上一页全页捕获时写入
+                    exit_signalled = False
+                    next_title = next_entry_titles[0] if next_entry_titles else ''
+                    self._log(f'[出口检测] DOM={current_dom_title!r} next={next_title!r} entry={entry_titles[:3]}')
+
+                    # 确认DOM变了：DOM标题匹配下一章节（含全部子章节标题）
+                    if current_dom_title and any(
+                        _normalize_text(nt) == _normalize_text(current_dom_title)
+                        or _normalize_text(nt) in _normalize_text(current_dom_title)
+                        or _normalize_text(current_dom_title) in _normalize_text(nt)
+                        for nt in next_entry_titles
+                    ):
+                        exit_signalled = True
+
+                    if exit_signalled:
+                        if _canvas_matches_title(raw, next_title):
+                            # 【出口①】Canvas匹配 → 上页全是原章内容
+                            # 当前页的内容（raw）尚未写入ch_lines → ch_lines即原章全部内容
+                            self._log(f'章节结束: {ch_title} (Canvas匹配下章: {next_title})')
                             with open(out_file, 'w', encoding='utf-8') as f:
                                 f.write(f'# {ch_title}\n\n')
                                 f.write('\n'.join(ch_lines))
@@ -1296,24 +1369,99 @@ class WeReadExporter:
                             self._log(f'已完成: {out_file} ({size/1024:.1f} KB)')
                             output_files.append(out_file)
 
-                            # 切换到下一个章节
+                            # 切换到下一章，当前raw是下一章内容
                             active_ch_idx += 1
                             if active_ch_idx >= max_ch:
                                 break
                             ch_title, out_file, ch_info, entry_titles, first_sub_title, next_entry_titles, max_chapter_pages = _setup_chapter(active_ch_idx)
                             page_buffer = []
                             ch_page_num = 0
-                            # 当前页内容已包含下一章节标题，直接标记进入
                             chapter_entered = True
-                            first_page_side = _determine_start_side(raw, ch_title)
-                            # 写入标题页内容（非空时）
-                            if raw:
-                                page_lines = _reassemble_page(raw)
-                                if page_lines:
-                                    ch_lines.extend(page_lines)
+                            ch_lines_len_before_append = len(ch_lines)
+                            next_lines = _reassemble_page(raw)
+                            if next_lines:
+                                ch_lines.extend(next_lines)
+                                ch_lines.append('')
+                            prev_raw = raw
+
+                        else:
+                            # Canvas不匹配 → ArrowLeft回退到过渡屏
+                            self._log('出口检测: DOM变了但Canvas未匹配下章，ArrowLeft回退')
+                            page.evaluate('window._capturedTexts = []')
+                            page.keyboard.press('ArrowLeft')
+                            time.sleep(PAGE_SLEEP)
+                            check_raw = page.evaluate(
+                                '() => { var t = window._capturedTexts || []; '
+                                'window._capturedTexts = []; return t; }'
+                            ) or []
+
+                            if _canvas_matches_title(check_raw, next_title):
+                                # 【出口②】过渡屏右侧有下章标题
+                                # 原章保留至左页：回退至过渡屏写入前，只追加左页
+                                self._log(f'章节结束: {ch_title} (过渡屏右侧匹配下章)')
+                                ch_lines = ch_lines[:ch_lines_len_before_append]
+                                left_lines = _reassemble_page(check_raw, side='left')
+                                if left_lines:
+                                    ch_lines.extend(left_lines)
                                     ch_lines.append('')
-                                prev_raw = raw
-                            continue
+
+                                with open(out_file, 'w', encoding='utf-8') as f:
+                                    f.write(f'# {ch_title}\n\n')
+                                    f.write('\n'.join(ch_lines))
+                                size = os.path.getsize(out_file)
+                                self._log(f'已完成: {out_file} ({size/1024:.1f} KB)')
+                                output_files.append(out_file)
+
+                                # 过渡屏右页是下章开头
+                                active_ch_idx += 1
+                                if active_ch_idx >= max_ch:
+                                    break
+                                ch_title, out_file, ch_info, entry_titles, first_sub_title, next_entry_titles, max_chapter_pages = _setup_chapter(active_ch_idx)
+                                page_buffer = []
+                                ch_page_num = 0
+                                chapter_entered = True
+                                ch_lines_len_before_append = len(ch_lines)
+                                right_lines = _reassemble_page(check_raw, side='right')
+                                if right_lines:
+                                    ch_lines.extend(right_lines)
+                                    ch_lines.append('')
+                                prev_raw = check_raw
+
+                            else:
+                                # 【出口③】过渡屏也无匹配 → 图片标题
+                                # 原章保留过渡屏左右两页（图片标题页内容为空，不影响）
+                                self._log(f'章节结束: {ch_title} (图片标题)')
+                                with open(out_file, 'w', encoding='utf-8') as f:
+                                    f.write(f'# {ch_title}\n\n')
+                                    f.write('\n'.join(ch_lines))
+                                size = os.path.getsize(out_file)
+                                self._log(f'已完成: {out_file} ({size/1024:.1f} KB)')
+                                output_files.append(out_file)
+
+                                # ArrowRight前进到下一屏
+                                page.keyboard.press('ArrowRight')
+                                time.sleep(PAGE_SLEEP)
+
+                                active_ch_idx += 1
+                                if active_ch_idx >= max_ch:
+                                    break
+                                ch_title, out_file, ch_info, entry_titles, first_sub_title, next_entry_titles, max_chapter_pages = _setup_chapter(active_ch_idx)
+                                page_buffer = []
+                                ch_page_num = 0
+                                chapter_entered = True
+                                first_page_side = 'left'
+                                ch_lines_len_before_append = len(ch_lines)
+                                new_raw = page.evaluate(
+                                    '() => { var t = window._capturedTexts || []; '
+                                    'window._capturedTexts = []; return t; }'
+                                ) or []
+                                if new_raw:
+                                    page_lines = _reassemble_page(new_raw)
+                                    if page_lines:
+                                        ch_lines.extend(page_lines)
+                                        ch_lines.append('')
+                                    prev_raw = new_raw
+                        continue
 
                 # 空页处理
                 if not raw:
@@ -1335,6 +1483,7 @@ class WeReadExporter:
 
                 # 写入内容
                 if raw and chapter_entered:
+                    ch_lines_len_before_append = len(ch_lines)
                     page_lines = _reassemble_page(raw)
                     if page_lines:
                         ch_lines.extend(page_lines)
