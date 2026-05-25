@@ -21,10 +21,12 @@ output/
 logs/
 
 # 调试/测试脚本（非生产）
+debug_*.py
+_find_*.py
+_fetch_*.py
+_test_*.py
+export_*.py
 debug_nav*.py
-export_keynes.py
-export_simple.py
-_test_book.py
 
 # 系统文件
 .DS_Store
