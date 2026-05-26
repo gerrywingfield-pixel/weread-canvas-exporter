@@ -10,6 +10,7 @@
 - [完整工作流（推荐）](#完整工作流推荐)
 - [快速开始（5分钟）](#快速开始5分钟)
 - [CLI 命令参考](#cli-命令参考)
+- [双ID系统：bookId vs readerId](#双id系统bookid-vs-readerid)
 - [后处理排版](#后处理排版)
 - [导出文件在哪里](#导出文件在哪里)
 - [常见问题](#常见问题)
@@ -66,7 +67,7 @@ python scripts/format_export.py <bookId>
   疑似图片标题: 6/25
   ✅ 无级联删除风险
 
-✅ 排版完成: output/芯片浪潮：纳米工艺背后的全球竞争_排版版.md
+✅ 排版完成: output/芯片浪潮：纳米工艺背后的全球竞争 - 佚名/芯片浪潮：纳米工艺背后的全球竞争_排版版.md
    保留 15 章, 排除 4 章
    共 11046 行 / 226KB
 ```
@@ -161,6 +162,40 @@ python scripts/format_export.py 3300067765            # 再排版
 
 ---
 
+## 双ID系统：bookId vs readerId
+
+微信读书有两种 ID，容易混淆，搞错会导致导出失败。
+
+| ID 类型 | 格式示例 | 用途 | 说明 |
+|:--------|:---------|:-----|:-----|
+| **bookId** | `3300199463` | 官方 REST API | 查书籍详情、作者、目录、付费状态 |
+| **readerId** | `f4d32800813abb46ag013359` | 浏览器阅读器 URL | `--export` 导出时必需的 ID |
+
+**一句话规则**：
+- `--export` 参数 → **只接受 readerId**。`python weread_exporter.py --export 3300199463` 会 404 崩溃
+- API 查作者/目录/付费 → **只接受 bookId**。`get_book_info(readerId)` 返回空
+
+### 怎么拿到正确的 ID？
+
+**书架书**（`--list`）：输出的就是 readerId，直接用于 `--export`。API 调用由代码自动匹配。
+
+**搜索来的书**（不在书架）：搜索 API 返回的是 bookId。readerId 需要从浏览器搜索页获取——打开 `weread.qq.com` → 搜书名 → 点进结果 → 浏览器地址栏 URL 中的 `web/reader/` 后面就是 readerId。
+
+> 在 AI Agent（Hermes）编排下，搜索→获取 readerId→导出是自动完成的。纯 CLI 用户需要手动从浏览器获取 readerId。
+
+### 代码自动解析
+
+`export_book()` 内部内置了 `_resolve_book_ids()`，传入 readerId 后自动：
+1. 匹配书架 → 找到 bookId（书架书优先）
+2. 用书名搜索 API → 补全 bookId、作者、付费类型（搜索书的兜底）
+3. 从页面版权文本提取（最终兜底）
+
+所以传给 `--export` 一个 readerId，代码会自动找到作者名和付费状态，输出目录正确命名为 `书名 - 作者名/`。
+
+---
+
+---
+
 ## 后处理排版
 
 导出后的纯文本经过 `scripts/format_export.py` 加工，产出符合目录结构的 Markdown。
@@ -244,6 +279,12 @@ cp output/* /mnt/c/Users/你的用户名/Desktop/ -r
 nohup python weread_exporter.py --export <readerId> > export.log 2>&1 &
 tail -f export.log
 ```
+
+### `--export 3300199463` 报了 404 错误？
+
+`--export` **只接受 readerId**（编码字符串格式），不接受数字 bookId。两者的区别见[双ID系统](#双id系统bookid-vs-readerid)章节。
+
+书架书通过 `--list` 拿到的就是 readerId。搜索来的书需要从浏览器搜索页的阅读器 URL 中提取 readerId。
 
 ### WSL 关了 / 崩溃了怎么办？
 
