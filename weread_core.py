@@ -666,6 +666,140 @@ class WeReadExporter:
             return results;
         }""")
 
+    # ─── 双 ID 解析 ─────────────────────────────
+
+    def is_reader_id(self, book_id: str) -> bool:
+        """判断 book_id 是否为 readerId 格式（非纯数字的编码字符串）"""
+        return not book_id.isdigit() and len(book_id) > 20
+
+    def _resolve_book_ids(self, book_id: str, book_title: str = None,
+                          page=None) -> dict:
+        """
+        将任意格式的 book_id 解析为 {'reader_id', 'book_id', 'title', 'author', 'pay_type'}。
+
+        解析顺序（API Key 可用时自动双 ID 补充）：
+          1. 书架匹配（get_shelf_full → readerId + bookId）
+          2. 搜索 API / get_book_info → 数字 bookId
+          3. 页面版权文本提取（title/author）
+
+        ⚠️ 浏览器搜索 readerId 不属于此方法职责。
+           搜索来的书（不在书架）的 readerId 由 Agent（编排层）
+           从浏览器搜索页获取后传入 --export。代码只负责：
+           - readerId → 浏览器导航导出
+           - bookId → API 查询（作者、目录、付费检测）
+
+        参数:
+            book_id: 传入的 ID（可能是 readerId 或 数字 bookId）
+            book_title: 可选，书名（加快搜索）
+            page: 可选，复用浏览器页面
+
+        返回:
+            dict: {'reader_id': ..., 'book_id': ..., 'title': ..., 'author': ..., 'pay_type': ...}
+                  无法解析的字段为 None
+        """
+        result = {'reader_id': None, 'book_id': None,
+                  'title': book_title or None, 'author': None, 'pay_type': None}
+        _id = book_id.strip()
+        is_rid = self.is_reader_id(_id)
+
+        # readerId 格式：直接使用，不需要浏览器搜索（已经是最佳路径）
+        if is_rid:
+            result['reader_id'] = _id
+
+        # ── ① 书架匹配 ──
+        try:
+            shelf = get_shelf_full()
+            reader_to_book = {b.get('readerId'): b for b in shelf if b.get('readerId')}
+            book_to_shelf = {str(b.get('bookId')): b for b in shelf if b.get('bookId')}
+            # 传入的是 readerId
+            if _id in reader_to_book:
+                entry = reader_to_book[_id]
+                result['reader_id'] = _id
+                result['book_id'] = str(entry.get('bookId', ''))
+                result['title'] = entry.get('title', book_title)
+            # 传入的是 bookId
+            elif _id in book_to_shelf:
+                entry = book_to_shelf[_id]
+                result['book_id'] = _id
+                result['reader_id'] = entry.get('readerId')
+                result['title'] = entry.get('title', book_title)
+            # 书名模糊匹配
+            elif book_title:
+                for b in shelf:
+                    st = b.get('title', '')
+                    if book_title in st or st in book_title:
+                        result['reader_id'] = b.get('readerId')
+                        result['book_id'] = str(b.get('bookId', ''))
+                        result['title'] = st
+                        break
+        except Exception:
+            pass
+
+        # ── ② API 获取 bookId（搜索 API 或 get_book_info）──
+        api_key_available = bool(os.environ.get('WEREAD_API_KEY', ''))
+        if not api_key_available:
+            env_path = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), 'config', '.env')
+            if os.path.exists(env_path):
+                with open(env_path) as f:
+                    for line in f:
+                        if line.startswith('WEREAD_API_KEY='):
+                            api_key_available = bool(line.strip().split('=', 1)[1])
+                            break
+
+        if api_key_available:
+            try:
+                if not result['book_id'] and _id.isdigit():
+                    result['book_id'] = _id
+                if result['book_id']:
+                    info = get_book_info(result['book_id'])
+                    result['title'] = info.get('title', result['title'])
+                    result['author'] = info.get('author', result['author'])
+            except Exception:
+                pass
+            # 搜索 API：用书名搜 bookId
+            if not result['book_id'] and result['title']:
+                try:
+                    from config.official_api import search
+                    sres = search(result['title'], count=5)
+                    for res in sres.get('results', []):
+                        for bk in res.get('books', []):
+                            bi = bk.get('bookInfo', {})
+                            if result['title'] in bi.get('title', '') or \
+                               (book_title and book_title in bi.get('title', '')):
+                                result['book_id'] = str(bi.get('bookId', ''))
+                                result['author'] = bi.get('author', result['author'])
+                                pt = bi.get('payType', None)
+                                if pt is not None:
+                                    result['pay_type'] = pt
+                                break
+                        if result['book_id']:
+                            break
+                except Exception:
+                    pass
+
+        # ── ③ 书名补充（从页面读取）──
+        p = page or self._page
+        if not result['title'] and p:
+            try:
+                t = p.evaluate(
+                    '() => {var el = document.querySelector(".readerTopBar_title");'
+                    'return el ? el.textContent.trim() : ""}')
+                if t:
+                    result['title'] = t
+            except Exception:
+                pass
+
+        # ── ⑤ 作者补充（从版权页）──
+        if not result['author'] and result['book_id']:
+            try:
+                info = get_book_info(result['book_id'])
+                result['author'] = info.get('author', '')
+            except Exception:
+                pass
+
+        return result
+
     # ─── 导出 ──────────────────────────────────
 
     def export_book(self, book_id: str, output_dir: str = None,
@@ -685,8 +819,19 @@ class WeReadExporter:
             raise RuntimeError('未登录，请先调用 login()')
 
         page = self._page
+
+        # 解析双 ID：readerId（浏览器导航） + bookId（API 调用）
+        resolved = self._resolve_book_ids(book_id, page=page)
+        reader_id = resolved.get('reader_id') or book_id
+        api_book_id = resolved.get('book_id') or \
+            (book_id if book_id.isdigit() else None)
+        resolved_title = resolved.get('title')
+        resolved_author = resolved.get('author')
+        self._log(f'ID解析: reader_id={reader_id}, book_id={api_book_id}, '
+                  f'作者={resolved_author}')
+
         self._log('打开阅读器...')
-        page.goto(f'https://weread.qq.com/web/reader/{book_id}',
+        page.goto(f'https://weread.qq.com/web/reader/{reader_id}',
                   wait_until='domcontentloaded', timeout=30000)
         time.sleep(8)
 
@@ -721,25 +866,37 @@ class WeReadExporter:
                 # 自动模式：默认导试读
                 self._log('本书需要付费会员才能阅读完整内容，自动导出试读部分')
 
-        # 获取书名
-        book_title = page.evaluate("""() => {
+        # 获取书名（优先用解析结果，再回退到页面读取）
+        book_title = resolved_title or page.evaluate("""() => {
             var el = document.querySelector('.readerTopBar_title');
             return el ? el.textContent.trim() : '未命名书籍';
         }""")
 
-        # 获取作者（直接通过 API 获取）
-        book_author = ''
-        try:
-            info = get_book_info(book_id)
-            book_author = info.get('author', '') or ''
-        except Exception:
-            # 兜底：book_id 可能是 readerId，尝试匹配书架
+        # 获取作者（优先级：resolve 结果 → API bookId → 搜索 API 用书名 → 版权页文本）
+        book_author = resolved_author or ''
+        if not book_author and api_book_id:
             try:
-                shelf = get_shelf_full()
-                for b in shelf:
-                    if b.get('readerId') == book_id:
-                        info = get_book_info(str(b['bookId']))
-                        book_author = info.get('author', '') or ''
+                info = get_book_info(api_book_id)
+                book_author = info.get('author', '') or ''
+            except Exception:
+                pass
+        if not book_author and book_title:
+            # 用书名搜索 API 获取作者
+            try:
+                from config.official_api import search
+                sres = search(book_title, count=5)
+                for res in sres.get('results', []):
+                    for bk in res.get('books', []):
+                        bi = bk.get('bookInfo', {})
+                        if book_title in bi.get('title', ''):
+                            book_author = bi.get('author', book_author)
+                            if not api_book_id:
+                                api_book_id = str(bi.get('bookId', ''))
+                                pt = bi.get('payType', None)
+                                self._log(f'搜索API补充: book_id={api_book_id}, '
+                                          f'作者={book_author}, payType={pt}')
+                            break
+                    if book_author:
                         break
             except Exception:
                 pass
